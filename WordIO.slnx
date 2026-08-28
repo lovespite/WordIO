@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/WordIO.Core/WordIO.Core.csproj" />
+    <Project Path="src/WordIO.Mini/WordIO.Mini.csproj" />
+  </Folder>
+</Solution>
