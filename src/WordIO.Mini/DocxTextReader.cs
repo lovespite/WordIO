@@ -39,7 +39,8 @@ public static class DocxTextReader
             ?? throw new InvalidDataException("word/document.xml does not contain a body element.");
 
         var numbering = ReadNumbering(archive);
-        return BuildDocument(body, numbering);
+        var relationships = ReadRelationships(archive);
+        return BuildDocument(body, numbering, relationships, archive);
     }
 
     private static IReadOnlyDictionary<int, bool> ReadNumbering(ZipArchive archive)
@@ -101,7 +102,11 @@ public static class DocxTextReader
         return orderedByNumberingId;
     }
 
-    private static Document BuildDocument(XmlElement body, IReadOnlyDictionary<int, bool> numbering)
+    private static Document BuildDocument(
+        XmlElement body,
+        IReadOnlyDictionary<int, bool> numbering,
+        IReadOnlyDictionary<string, string> relationships,
+        ZipArchive archive)
     {
         var document = new Document();
         var section = new Section();
@@ -114,7 +119,17 @@ public static class DocxTextReader
             switch (child.LocalName)
             {
                 case "p":
-                    AddParagraph(section, ParseParagraph(child), numbering, ref activeList);
+                    AddParagraph(section.Blocks, ParseParagraph(child), numbering, ref activeList);
+
+                    var paragraphSectionProperties = child.Element("pPr")?.Element("sectPr");
+                    if (paragraphSectionProperties is not null)
+                    {
+                        ParseSectionProperties(paragraphSectionProperties, section, numbering, relationships, archive);
+                        section = new Section();
+                        document.Sections.Add(section);
+                        activeList = null;
+                    }
+
                     break;
 
                 case "tbl":
@@ -123,10 +138,11 @@ public static class DocxTextReader
                     break;
 
                 case "sdt":
-                    AddStructuredDocumentContent(child, section, numbering, ref activeList);
+                    AddStructuredDocumentContent(child, section.Blocks, numbering, ref activeList);
                     break;
 
                 case "sectPr":
+                    ParseSectionProperties(child, section, numbering, relationships, archive);
                     break;
             }
         }
@@ -136,7 +152,7 @@ public static class DocxTextReader
 
     private static void AddStructuredDocumentContent(
         XmlElement structuredDocument,
-        Section section,
+        IList<Block> blocks,
         IReadOnlyDictionary<int, bool> numbering,
         ref List? activeList)
     {
@@ -147,16 +163,16 @@ public static class DocxTextReader
                 switch (child.LocalName)
                 {
                     case "p":
-                        AddParagraph(section, ParseParagraph(child), numbering, ref activeList);
+                        AddParagraph(blocks, ParseParagraph(child), numbering, ref activeList);
                         break;
 
                     case "tbl":
                         activeList = null;
-                        section.Blocks.Add(ParseTable(child));
+                        blocks.Add(ParseTable(child));
                         break;
 
                     case "sdt":
-                        AddStructuredDocumentContent(child, section, numbering, ref activeList);
+                        AddStructuredDocumentContent(child, blocks, numbering, ref activeList);
                         break;
                 }
             }
@@ -164,7 +180,7 @@ public static class DocxTextReader
     }
 
     private static void AddParagraph(
-        Section section,
+        IList<Block> blocks,
         Paragraph paragraph,
         IReadOnlyDictionary<int, bool> numbering,
         ref List? activeList)
@@ -172,7 +188,7 @@ public static class DocxTextReader
         if (paragraph.NumberingId is not int numberingId)
         {
             activeList = null;
-            section.Blocks.Add(paragraph);
+            blocks.Add(paragraph);
             return;
         }
 
@@ -186,11 +202,204 @@ public static class DocxTextReader
             activeList = ordered
                 ? new OrderedList { NumberingId = numberingId, Level = paragraph.IndentLevel }
                 : new List { NumberingId = numberingId, Level = paragraph.IndentLevel };
-            section.Blocks.Add(activeList);
+            blocks.Add(activeList);
         }
 
         activeList.Items.Add(paragraph);
     }
+
+    private static void AddContainerBlocks(
+        XmlElement container,
+        IList<Block> blocks,
+        IReadOnlyDictionary<int, bool> numbering)
+    {
+        List? activeList = null;
+
+        foreach (var child in container.Children)
+        {
+            switch (child.LocalName)
+            {
+                case "p":
+                    AddParagraph(blocks, ParseParagraph(child), numbering, ref activeList);
+                    break;
+
+                case "tbl":
+                    activeList = null;
+                    blocks.Add(ParseTable(child));
+                    break;
+
+                case "sdt":
+                    AddStructuredDocumentContent(child, blocks, numbering, ref activeList);
+                    break;
+            }
+        }
+    }
+
+    private static IReadOnlyDictionary<string, string> ReadRelationships(ZipArchive archive)
+    {
+        var relationshipsEntry = archive.GetEntry("word/_rels/document.xml.rels");
+        if (relationshipsEntry is null)
+        {
+            return new Dictionary<string, string>();
+        }
+
+        using var stream = relationshipsEntry.Open();
+        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        var xml = SimpleXmlParser.Parse(reader.ReadToEnd());
+        var relationships = new Dictionary<string, string>(StringComparer.Ordinal);
+        var root = xml.Root;
+
+        if (root is null)
+        {
+            return relationships;
+        }
+
+        foreach (var relationship in root.Elements("Relationship"))
+        {
+            var type = relationship.GetAttribute("Type");
+            if (type is null ||
+                (!type.EndsWith("/header", StringComparison.Ordinal) &&
+                 !type.EndsWith("/footer", StringComparison.Ordinal)))
+            {
+                continue;
+            }
+
+            var id = relationship.GetAttribute("Id");
+            var target = relationship.GetAttribute("Target");
+
+            if (!string.IsNullOrWhiteSpace(id) && !string.IsNullOrWhiteSpace(target))
+            {
+                relationships[id] = ResolvePartPath(target);
+            }
+        }
+
+        return relationships;
+    }
+
+    private static string ResolvePartPath(string target)
+    {
+        if (target.StartsWith("/", StringComparison.Ordinal))
+        {
+            return target.TrimStart('/');
+        }
+
+        return "word/" + target;
+    }
+
+    private static void ParseSectionProperties(
+        XmlElement sectionProperties,
+        Section section,
+        IReadOnlyDictionary<int, bool> numbering,
+        IReadOnlyDictionary<string, string> relationships,
+        ZipArchive archive)
+    {
+        foreach (var reference in sectionProperties.Children)
+        {
+            switch (reference.LocalName)
+            {
+                case "headerReference":
+                    AddHeaderFooterPart(
+                        reference,
+                        section.Headers,
+                        new Header(),
+                        numbering,
+                        relationships,
+                        archive);
+                    break;
+
+                case "footerReference":
+                    AddHeaderFooterPart(
+                        reference,
+                        section.Footers,
+                        new Footer(),
+                        numbering,
+                        relationships,
+                        archive);
+                    break;
+            }
+        }
+    }
+
+    private static void AddHeaderFooterPart(
+        XmlElement reference,
+        IList<Header> headers,
+        Header header,
+        IReadOnlyDictionary<int, bool> numbering,
+        IReadOnlyDictionary<string, string> relationships,
+        ZipArchive archive)
+    {
+        var relationshipId = reference.GetAttribute("id");
+        if (string.IsNullOrWhiteSpace(relationshipId) ||
+            !relationships.TryGetValue(relationshipId, out var target))
+        {
+            return;
+        }
+
+        header.RelationshipId = relationshipId;
+        header.Kind = ParseHeaderFooterKind(reference.GetAttribute("type"));
+
+        if (ReadHeaderFooterPart(target, header, numbering, archive))
+        {
+            headers.Add(header);
+        }
+    }
+
+    private static void AddHeaderFooterPart(
+        XmlElement reference,
+        IList<Footer> footers,
+        Footer footer,
+        IReadOnlyDictionary<int, bool> numbering,
+        IReadOnlyDictionary<string, string> relationships,
+        ZipArchive archive)
+    {
+        var relationshipId = reference.GetAttribute("id");
+        if (string.IsNullOrWhiteSpace(relationshipId) ||
+            !relationships.TryGetValue(relationshipId, out var target))
+        {
+            return;
+        }
+
+        footer.RelationshipId = relationshipId;
+        footer.Kind = ParseHeaderFooterKind(reference.GetAttribute("type"));
+
+        if (ReadHeaderFooterPart(target, footer, numbering, archive))
+        {
+            footers.Add(footer);
+        }
+    }
+
+    private static bool ReadHeaderFooterPart(
+        string partPath,
+        HeaderFooterBase target,
+        IReadOnlyDictionary<int, bool> numbering,
+        ZipArchive archive)
+    {
+        var entry = archive.GetEntry(partPath);
+        if (entry is null)
+        {
+            return false;
+        }
+
+        using var stream = entry.Open();
+        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        var xml = SimpleXmlParser.Parse(reader.ReadToEnd());
+
+        if (xml.Root is null)
+        {
+            return false;
+        }
+
+        AddContainerBlocks(xml.Root, target.Blocks, numbering);
+        return true;
+    }
+
+    private static HeaderFooterKind ParseHeaderFooterKind(string? value) =>
+        value?.Trim().ToLowerInvariant() switch
+        {
+            "first" => HeaderFooterKind.First,
+            "even" => HeaderFooterKind.Even,
+            _ => HeaderFooterKind.Default
+        };
 
     private static Paragraph ParseParagraph(XmlElement element)
     {

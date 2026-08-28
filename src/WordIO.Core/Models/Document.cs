@@ -15,5 +15,11 @@ public sealed class Document
 
     public IEnumerable<List> Lists => Blocks.OfType<List>();
 
-    public string Text => string.Join(Environment.NewLine, Blocks.Select(static block => block.Text));
+    public IEnumerable<Header> Headers => Sections.SelectMany(static section => section.Headers);
+
+    public IEnumerable<Footer> Footers => Sections.SelectMany(static section => section.Footers);
+
+    public string BodyText => string.Join(Environment.NewLine, Blocks.Select(static block => block.Text));
+
+    public string Text => string.Join(Environment.NewLine, Sections.Select(static section => section.Text));
 }

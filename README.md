@@ -11,7 +11,7 @@ WordIO 是一个零外部依赖的 C#/.NET 10 DOCX 文本读取示例，包含�
 WordIO.slnx
 src/
   WordIO.Core/
-    Models/           Document、Section、Paragraph、Run、Table、List、OrderedList 等
+    Models/           Document、Section、Paragraph、Run、Table、List、OrderedList、Header、Footer 等
     Xml/              简易 XML Parser
   WordIO.Mini/
     DocxTextReader.cs DOCX 读取入口
@@ -48,4 +48,4 @@ var document = DocxTextReader.Read(@"document.docx");
 Console.WriteLine(document.Text);
 ```
 
-`Document.Text` 会按段落、列表项和表格输出纯文本；模型对象仍保留 `Paragraph`、`Run`、`Table`、`List`、`OrderedList` 等结构，可用于后续处理。
+`Document.Text` 会按“页眉 → 正文 → 页脚”的顺序输出纯文本；模型对象仍保留 `Paragraph`、`Run`、`Table`、`List`、`OrderedList`、`Header`、`Footer` 等结构，可用于后续处理。页眉和页脚也可以通过 `document.Headers` / `document.Footers` 访问。
